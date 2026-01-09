@@ -74,7 +74,7 @@ class Server:
         return deck
 
     def calculate_hand_value(self, hand):
-        [cite_start]"""Calculates the value of a hand according to Blackjack rules [cite: 32-35]"""
+        """Calculates the value of a hand according to Blackjack rules"""
         value = 0
         aces = 0
         for rank, suit in hand:
@@ -93,7 +93,7 @@ class Server:
         return value
 
     def send_card(self, client_socket, rank, suit, result_code=consts.RESULT_ROUND_NOT_OVER):
-        [cite_start]"""Helper to pack and send a payload message [cite: 123-125]"""
+        """Helper to pack and send a payload message"""
         packet = struct.pack(consts.PAYLOAD_SERVER_FMT,
                              consts.MAGIC_COOKIE,
                              consts.MSG_TYPE_PAYLOAD,
@@ -124,7 +124,7 @@ class Server:
                 player_hand = []
                 dealer_hand = []
 
-                # [cite_start]Initial Deal: 2 cards each [cite: 40-46]
+                # Initial Deal: 2 cards each
                 # Deal to player (send immediately)
                 c1 = deck.pop(); player_hand.append(c1); self.send_card(client_socket, *c1)
                 c2 = deck.pop(); player_hand.append(c2); self.send_card(client_socket, *c2)
@@ -133,7 +133,7 @@ class Server:
                 d1 = deck.pop(); dealer_hand.append(d1)
                 d2 = deck.pop(); dealer_hand.append(d2) 
                 
-                # [cite_start]Player Turn [cite: 47-53]
+                # Player Turn
                 player_bust = False
                 while True:
                     player_val = self.calculate_hand_value(player_hand)
@@ -151,7 +151,7 @@ class Server:
 
                     if decision == "Stand":
                         break
-                    [cite_start]elif decision == "Hittt": # Note: "Hittt" per protocol spec [cite: 122]
+                    elif decision == "Hittt": # Note: "Hittt" per protocol spec
                         new_card = deck.pop()
                         player_hand.append(new_card)
                         self.send_card(client_socket, *new_card)
@@ -159,7 +159,7 @@ class Server:
                         print(f"Unknown decision: {decision}")
                         break
 
-                # [cite_start]Dealer Turn [cite: 54-63]
+                # Dealer Turn
                 dealer_val = self.calculate_hand_value(dealer_hand)
                 if not player_bust:
                     # Logic: Hit if < 17
@@ -168,7 +168,7 @@ class Server:
                         dealer_hand.append(new_card)
                         dealer_val = self.calculate_hand_value(dealer_hand)
 
-                # [cite_start]Determine Winner [cite: 64-71]
+                # Determine Winner
                 player_val = self.calculate_hand_value(player_hand)
                 result = consts.RESULT_LOSS # Default
                 
@@ -190,7 +190,7 @@ class Server:
                     result = consts.RESULT_TIE
                     print(f"Round {round_num}: Tie.")
 
-                # [cite_start]Send Round Result (Using a dummy card 0,0 since round is over) [cite: 73]
+                # Send Round Result (Using a dummy card 0,0 since round is over)
                 self.send_card(client_socket, 0, 0, result)
 
             print(f"Finished playing with {client_name}. Closing connection.")
