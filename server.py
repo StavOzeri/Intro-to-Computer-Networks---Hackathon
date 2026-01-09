@@ -7,206 +7,282 @@ import random
 
 class Server:
     def __init__(self):
-        self.server_port = 0
-        self.server_ip = self.get_local_ip()
-        self.udp_socket = None
-        self.tcp_socket = None
-        self.team_name = "Festigal Fantasia" 
+        """
+        Setting up the server instance with necessary placeholders for network sockets
+        and identification data.
+        """
+        self.tcp_listening_port_number = 0
+        self.local_machine_ip_address = self.retrieve_network_interface_ip()
+        self.udp_broadcast_sender_socket = None
+        self.tcp_connection_listener_socket = None
+        # Keeping the team name as requested
+        self.participating_team_name = "Festigal Fantasia" 
 
-    def get_local_ip(self):
+    def retrieve_network_interface_ip(self):
+        """
+        We need to figure out what IP address this machine is actually using to talk
+        to the outside world (like the internet), to avoid getting stuck with a
+        useless localhost or WSL address.
+        """
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
+            # We create a dummy socket and try to reach a public DNS (Google)
+            # just to see which network interface the OS decides to use.
+            temp_socket_for_ip_check = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            temp_socket_for_ip_check.connect(("8.8.8.8", 80))
+            
+            detected_ip_address = temp_socket_for_ip_check.getsockname()[0]
+            temp_socket_for_ip_check.close()
+            
+            return detected_ip_address
         except Exception:
+            # Fallback to localhost if we are completely offline
             return "127.0.0.1"
 
     def start_server(self):
-        self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.tcp_socket.bind((self.server_ip, 0))
-        self.server_port = self.tcp_socket.getsockname()[1]
-        self.tcp_socket.listen()
+        """
+        Fires up the main TCP listener and kicks off the background thread that
+        shouts our existence via UDP.
+        """
+        self.tcp_connection_listener_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         
-        print(f"Server started, listening on IP address {self.server_ip}")
+        # Binding to port 0 lets the OS pick a free port for us
+        self.tcp_connection_listener_socket.bind((self.local_machine_ip_address, 0))
+        
+        self.tcp_listening_port_number = self.tcp_connection_listener_socket.getsockname()[1]
+        self.tcp_connection_listener_socket.listen()
+        
+        print(f"Server started, listening on IP address {self.local_machine_ip_address}")
 
-        broadcast_thread = threading.Thread(target=self.broadcast_offers)
-        broadcast_thread.daemon = True 
-        broadcast_thread.start()
+        # Spinning up the UDP announcer in the background so it doesn't block the main loop
+        background_broadcast_thread = threading.Thread(target=self.continuously_broadcast_availability)
+        background_broadcast_thread.daemon = True 
+        background_broadcast_thread.start()
+
+        # The main infinite loop waiting for players to join via TCP
+        while True:
+            try:
+                incoming_client_socket, incoming_client_address = self.tcp_connection_listener_socket.accept()
+                print(f"New client connected from {incoming_client_address}")
+                
+                # Setting a generous timeout (10 mins) because humans play slowly
+                incoming_client_socket.settimeout(600)
+                
+                # Handling each player in their own thread so we can multitask
+                dedicated_client_thread = threading.Thread(
+                    target=self.manage_individual_client_session, 
+                    args=(incoming_client_socket,)
+                )
+                dedicated_client_thread.start()
+                
+            except Exception as error_message:
+                print(f"Error accepting client: {error_message}")
+
+    def continuously_broadcast_availability(self):
+        """
+        This function runs forever in the background, sending out UDP packets
+        telling everyone 'Hey, I'm here and this is my port'.
+        """
+        self.udp_broadcast_sender_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_broadcast_sender_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+        # Packing the offer message strictly according to protocol
+        packed_offer_message = struct.pack(
+            consts.OFFER_PACKET_FMT, 
+            consts.MAGIC_COOKIE, 
+            consts.MSG_TYPE_OFFER, 
+            self.tcp_listening_port_number, 
+            self.participating_team_name.encode('utf-8').ljust(32, b'\0')
+        )
 
         while True:
             try:
-                client_socket, client_address = self.tcp_socket.accept()
-                print(f"New client connected from {client_address}")
-                
-                # Timeout of 10 minutes for gameplay
-                client_socket.settimeout(600)
-                
-                client_thread = threading.Thread(target=self.handle_client, args=(client_socket,))
-                client_thread.start()
-            except Exception as e:
-                print(f"Error accepting client: {e}")
-
-    def broadcast_offers(self):
-        self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-
-        packet = struct.pack(consts.OFFER_PACKET_FMT, 
-                             consts.MAGIC_COOKIE, 
-                             consts.MSG_TYPE_OFFER, 
-                             self.server_port, 
-                             self.team_name.encode('utf-8').ljust(32, b'\0'))
-
-        while True:
-            try:
-                self.udp_socket.sendto(packet, ('<broadcast>', consts.CLIENT_UDP_PORT))
+                self.udp_broadcast_sender_socket.sendto(
+                    packed_offer_message, 
+                    ('<broadcast>', consts.CLIENT_UDP_PORT)
+                )
+                # Sleep for a second to avoid spamming the network too hard
                 time.sleep(1) 
-            except Exception as e:
-                print(f"Error broadcasting: {e}")
+            except Exception as error_message:
+                print(f"Error broadcasting: {error_message}")
                 time.sleep(1)
 
-    def create_deck(self):
-        deck = []
-        for suit in range(4):
-            for rank in range(1, 14):
-                deck.append((rank, suit))
-        random.shuffle(deck)
-        return deck
+    def generate_fresh_deck(self):
+        new_deck_of_cards = []
+        # Loop through suits (0-3) and ranks (1-13) to build a full 52 card set
+        for card_suit_id in range(4):
+            for card_rank_value in range(1, 14):
+                new_deck_of_cards.append((card_rank_value, card_suit_id))
+        
+        random.shuffle(new_deck_of_cards)
+        return new_deck_of_cards
 
-    def calculate_hand_value(self, hand):
-        """Ace is strictly 11 points."""
-        value = 0
-        for rank, suit in hand:
-            if rank == 1: value += 11
-            elif rank >= 10: value += 10
-            else: value += rank
-        return value
+    def compute_total_hand_points(self, current_hand_of_cards):
+        """
+        Adds up the points. Remember: Per instructions, Ace is ALWAYS 11.
+        """
+        accumulated_score = 0
+        for rank_val, _ in current_hand_of_cards:
+            if rank_val == 1: 
+                accumulated_score += 11
+            elif rank_val >= 10: 
+                accumulated_score += 10
+            else: 
+                accumulated_score += rank_val
+        return accumulated_score
 
-    def send_card(self, client_socket, rank, suit, result_code=consts.RESULT_ROUND_NOT_OVER):
-        packet = struct.pack(consts.PAYLOAD_SERVER_FMT,
-                             consts.MAGIC_COOKIE,
-                             consts.MSG_TYPE_PAYLOAD,
-                             result_code,
-                             rank,
-                             suit)
-        client_socket.sendall(packet)
+    def transmit_game_state_packet(self, target_client_socket, card_rank, card_suit, game_result_code=consts.RESULT_ROUND_NOT_OVER):
+        binary_payload_packet = struct.pack(
+            consts.PAYLOAD_SERVER_FMT,
+            consts.MAGIC_COOKIE,
+            consts.MSG_TYPE_PAYLOAD,
+            game_result_code,
+            card_rank,
+            card_suit
+        )
+        target_client_socket.sendall(binary_payload_packet)
 
-    def handle_client(self, client_socket):
-        client_name = "Unknown"
+    def manage_individual_client_session(self, active_client_connection):
+        connected_team_name = "Unknown"
         
         try:
-            # 1. Handshake (Receive Request)
-            request_size = struct.calcsize(consts.REQUEST_PACKET_FMT)
-            data = client_socket.recv(request_size)
-            if not data or len(data) != request_size: return
-
-            cookie, msg_type, num_rounds, team_name_bytes = struct.unpack(consts.REQUEST_PACKET_FMT, data)
+            # Step 1: Handle the handshake (Request Packet)
+            expected_packet_size = struct.calcsize(consts.REQUEST_PACKET_FMT)
+            raw_received_bytes = active_client_connection.recv(expected_packet_size)
             
-            # --- SECURITY CHECK (Item 3) ---
-            # If the first message isn't a REQUEST, disconnect immediately.
-            if cookie != consts.MAGIC_COOKIE or msg_type != consts.MSG_TYPE_REQUEST:
+            if not raw_received_bytes or len(raw_received_bytes) != expected_packet_size:
+                return
+
+            # Breaking down the unpacked data into variables
+            unpacked_request_data = struct.unpack(consts.REQUEST_PACKET_FMT, raw_received_bytes)
+            received_cookie = unpacked_request_data[0]
+            received_msg_type = unpacked_request_data[1]
+            requested_rounds_count = unpacked_request_data[2]
+            raw_team_name_bytes = unpacked_request_data[3]
+            
+            # Security check: Kick them out if they didn't send a proper REQUEST msg
+            if received_cookie != consts.MAGIC_COOKIE or received_msg_type != consts.MSG_TYPE_REQUEST:
                 print(f"Invalid handshake from client. Closing.")
                 return
 
-            client_name = team_name_bytes.decode('utf-8').strip('\x00')
-            print(f"[{client_name}] Connected. Playing {num_rounds} rounds.")
+            connected_team_name = raw_team_name_bytes.decode('utf-8').strip('\x00')
+            print(f"[{connected_team_name}] Connected. Playing {requested_rounds_count} rounds.")
 
-            # 2. Play Rounds
-            for round_num in range(1, num_rounds + 1):
-                print(f"[{client_name}] --- Starting Round {round_num} ---")
-                deck = self.create_deck()
-                player_hand = []
-                dealer_hand = []
-
-                # Initial Deal
-                c1 = deck.pop(); player_hand.append(c1); self.send_card(client_socket, *c1)
-                c2 = deck.pop(); player_hand.append(c2); self.send_card(client_socket, *c2)
+            # Step 2: Loop through the requested number of rounds
+            for current_round_number in range(1, requested_rounds_count + 1):
+                print(f"[{connected_team_name}] --- Starting Round {current_round_number} ---")
                 
-                d1 = deck.pop(); dealer_hand.append(d1)
-                d2 = deck.pop(); dealer_hand.append(d2) 
+                current_game_deck = self.generate_fresh_deck()
+                cards_held_by_player = []
+                cards_held_by_dealer = []
 
-                print(f"[{client_name}] Dealer Face-Up: {consts.RANKS[d1[0]]} of {consts.SUITS[d1[1]]}")
+                # Initial Deal: Give 2 cards to player, 2 to dealer
+                player_card_1 = current_game_deck.pop()
+                cards_held_by_player.append(player_card_1)
+                self.transmit_game_state_packet(active_client_connection, *player_card_1)
+                
+                player_card_2 = current_game_deck.pop()
+                cards_held_by_player.append(player_card_2)
+                self.transmit_game_state_packet(active_client_connection, *player_card_2)
+                
+                dealer_visible_card = current_game_deck.pop()
+                cards_held_by_dealer.append(dealer_visible_card)
+                
+                dealer_hidden_card = current_game_deck.pop()
+                cards_held_by_dealer.append(dealer_hidden_card)
 
-                # Player Turn
-                player_bust = False
+                print(f"[{connected_team_name}] Dealer Face-Up: {consts.RANKS[dealer_visible_card[0]]} of {consts.SUITS[dealer_visible_card[1]]}")
+                
+                # --- FIX: Send the dealer's visible card to the client immediately ---
+                self.transmit_game_state_packet(active_client_connection, *dealer_visible_card)
+
+                # Player's Turn Loop
+                did_player_bust = False
                 while True:
-                    # --- DOUBLE ACE CHECK (Item 2) ---
-                    # This check runs immediately. If Hand > 21 (e.g. 2 Aces = 22), 
-                    # it sets bust=True and breaks immediately, skipping any input waiting.
-                    player_val = self.calculate_hand_value(player_hand)
-                    if player_val > 21:
-                        player_bust = True
+                    # Check for "Double Ace" or just bad luck immediately
+                    current_player_score = self.compute_total_hand_points(cards_held_by_player)
+                    if current_player_score > 21:
+                        did_player_bust = True
                         break 
 
                     try:
-                        data = client_socket.recv(struct.calcsize(consts.PAYLOAD_CLIENT_FMT))
+                        raw_action_data = active_client_connection.recv(struct.calcsize(consts.PAYLOAD_CLIENT_FMT))
                     except socket.timeout:
-                        print(f"[{client_name}] Timed out waiting for action.")
+                        print(f"[{connected_team_name}] Timed out waiting for action.")
                         return
 
-                    if not data: break
-                    
-                    _, _, decision_bytes = struct.unpack(consts.PAYLOAD_CLIENT_FMT, data)
-                    decision = decision_bytes.decode('utf-8').strip('\x00')
-
-                    if decision == "Stand":
+                    if not raw_action_data: 
                         break
-                    elif decision == "Hittt":
-                        new_card = deck.pop()
-                        player_hand.append(new_card)
-                        self.send_card(client_socket, *new_card)
+                    
+                    # Decoding the player's decision
+                    unpacked_action = struct.unpack(consts.PAYLOAD_CLIENT_FMT, raw_action_data)
+                    player_decision_string = unpacked_action[2].decode('utf-8').strip('\x00')
+
+                    if player_decision_string == "Stand":
+                        break
+                    elif player_decision_string == "Hittt":
+                        drawn_card = current_game_deck.pop()
+                        cards_held_by_player.append(drawn_card)
+                        self.transmit_game_state_packet(active_client_connection, *drawn_card)
                     else:
                         break
 
-                # Dealer Turn
-                dealer_val = self.calculate_hand_value(dealer_hand)
+                # Dealer's Turn (only happens if player is still in the game)
+                dealer_total_score = self.compute_total_hand_points(cards_held_by_dealer)
                 
-                if not player_bust:
-                    print(f"[{client_name}] Dealer reveals hidden: {consts.RANKS[d2[0]]} of {consts.SUITS[d2[1]]}")
-                    self.send_card(client_socket, *d2)
+                if not did_player_bust:
+                    # Show the card we were hiding
+                    print(f"[{connected_team_name}] Dealer reveals hidden: {consts.RANKS[dealer_hidden_card[0]]} of {consts.SUITS[dealer_hidden_card[1]]}")
+                    self.transmit_game_state_packet(active_client_connection, *dealer_hidden_card)
                     
-                    d_hand_str = [f"{consts.RANKS[r]} of {consts.SUITS[s]}" for r, s in dealer_hand]
-                    print(f"[{client_name}] Dealer hand: {d_hand_str} (Value: {dealer_val})")
+                    # Just for logging purposes
+                    dealer_hand_display = [f"{consts.RANKS[r]} of {consts.SUITS[s]}" for r, s in cards_held_by_dealer]
+                    print(f"[{connected_team_name}] Dealer hand: {dealer_hand_display} (Value: {dealer_total_score})")
                     
-                    while dealer_val < 17:
-                        new_card = deck.pop()
-                        dealer_hand.append(new_card)
-                        dealer_val = self.calculate_hand_value(dealer_hand)
-                        print(f"[{client_name}] Dealer draws: {consts.RANKS[new_card[0]]} of {consts.SUITS[new_card[1]]}")
-                        self.send_card(client_socket, *new_card)
+                    # Dealer hits until 17
+                    while dealer_total_score < 17:
+                        dealer_new_card = current_game_deck.pop()
+                        cards_held_by_dealer.append(dealer_new_card)
+                        dealer_total_score = self.compute_total_hand_points(cards_held_by_dealer)
+                        
+                        print(f"[{connected_team_name}] Dealer draws: {consts.RANKS[dealer_new_card[0]]} of {consts.SUITS[dealer_new_card[1]]}")
+                        self.transmit_game_state_packet(active_client_connection, *dealer_new_card)
 
-                # Determine Winner
-                player_val = self.calculate_hand_value(player_hand)
-                result = consts.RESULT_LOSS 
+                # Determine Winner Logic
+                final_player_score = self.compute_total_hand_points(cards_held_by_player)
+                final_round_result = consts.RESULT_LOSS 
                 
-                if player_bust:
-                    result = consts.RESULT_LOSS
-                    print(f"[{client_name}] Round {round_num}: Player Bust! Dealer Wins.")
-                elif dealer_val > 21:
-                    result = consts.RESULT_WIN
-                    print(f"[{client_name}] Round {round_num}: Dealer Bust! Player Wins.")
-                elif player_val > dealer_val:
-                    result = consts.RESULT_WIN
-                    print(f"[{client_name}] Round {round_num}: Player ({player_val}) > Dealer ({dealer_val}). Player Wins.")
-                elif dealer_val > player_val:
-                    result = consts.RESULT_LOSS
-                    print(f"[{client_name}] Round {round_num}: Dealer ({dealer_val}) > Player ({player_val}). Dealer Wins.")
+                if did_player_bust:
+                    final_round_result = consts.RESULT_LOSS
+                    print(f"[{connected_team_name}] Round {current_round_number}: Player Bust! Dealer Wins.")
+                
+                elif dealer_total_score > 21:
+                    final_round_result = consts.RESULT_WIN
+                    print(f"[{connected_team_name}] Round {current_round_number}: Dealer Bust! Player Wins.")
+                
+                elif final_player_score > dealer_total_score:
+                    final_round_result = consts.RESULT_WIN
+                    print(f"[{connected_team_name}] Round {current_round_number}: Player ({final_player_score}) > Dealer ({dealer_total_score}). Player Wins.")
+                
+                elif dealer_total_score > final_player_score:
+                    final_round_result = consts.RESULT_LOSS
+                    print(f"[{connected_team_name}] Round {current_round_number}: Dealer ({dealer_total_score}) > Player ({final_player_score}). Dealer Wins.")
+                
                 else:
-                    result = consts.RESULT_TIE
-                    print(f"[{client_name}] Round {round_num}: Tie ({player_val}).")
+                    final_round_result = consts.RESULT_TIE
+                    print(f"[{connected_team_name}] Round {current_round_number}: Tie ({final_player_score}).")
 
-                self.send_card(client_socket, 0, 0, result)
+                # Send the final verdict to the client
+                self.transmit_game_state_packet(active_client_connection, 0, 0, final_round_result)
 
-            print(f"[{client_name}] Finished playing. Closing connection.")
+            print(f"[{connected_team_name}] Finished playing. Closing connection.")
 
         except socket.timeout:
-            print(f"[{client_name}] Timed out.")
-        except Exception as e:
-            print(f"[{client_name}] Error handling client: {e}")
+            print(f"[{connected_team_name}] Timed out.")
+        except Exception as error_msg:
+            print(f"[{connected_team_name}] Error handling client: {error_msg}")
         finally:
-            client_socket.close()
+            active_client_connection.close()
 
 if __name__ == "__main__":
-    server = Server()
-    server.start_server()
+    game_server_instance = Server()
+    game_server_instance.start_server()

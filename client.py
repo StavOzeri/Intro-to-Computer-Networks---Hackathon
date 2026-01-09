@@ -4,187 +4,247 @@ import consts
 
 class Client:
     def __init__(self):
-        self.server_ip = None
-        self.server_port = None
-        self.base_team_name = "Festigal Fantasia" 
-        self.udp_socket = None
-        self.tcp_socket = None
-        self.my_cards = []
-        self.player_full_name = ""
-        self.requested_rounds = 0
+        """
+        Initializing the client state variables.
+        """
+        self.target_server_ip = None
+        self.target_server_port = None
+        self.base_team_name_string = "Festigal Fantasia" 
+        self.udp_listening_socket = None
+        self.tcp_game_socket = None
+        self.cards_currently_held = []
+        self.full_player_display_name = ""
+        self.number_of_rounds_requested = 0
 
     def start_client(self):
-        # 1. Ask for player name ONCE (Step 3a)
-        player_id = input("Enter player number (e.g. 1, 2): ")
-        self.player_full_name = f"{self.base_team_name} {player_id}"
-        print(f"Playing as: {self.player_full_name}")
+        """
+        This is where it all begins. We get the name once, then loop forever looking for games.
+        """
+        self.prompt_user_for_identification()
 
-        # Loop: Connect -> Play -> Disconnect -> Ask Rounds -> Connect...
         while True:
-            # 2. Ask for rounds EVERY time (Step 3b - per new instructions)
-            self.get_rounds_input()
+            # We ask for rounds count inside the loop now per new instructions
+            self.prompt_user_for_desired_rounds()
 
             print("Client started, listening for offer requests...")
             
-            self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.udp_listening_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
-                self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                # Need REUSEPORT to allow multiple clients on one machine if needed
+                self.udp_listening_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             except AttributeError:
-                self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                # Fallback for Windows which uses REUSEADDR
+                self.udp_listening_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 
-            self.udp_socket.bind(("", consts.CLIENT_UDP_PORT))
+            self.udp_listening_socket.bind(("", consts.CLIENT_UDP_PORT))
 
-            # Listen for UDP offers
+            # Infinite loop to catch a valid offer packet
             while True:
-                data, addr = self.udp_socket.recvfrom(consts.BUFFER_SIZE)
+                raw_udp_data, sender_address_tuple = self.udp_listening_socket.recvfrom(consts.BUFFER_SIZE)
+                
                 try:
-                    cookie, msg_type, server_port, server_name_bytes = struct.unpack(consts.OFFER_PACKET_FMT, data)
-                    if cookie != consts.MAGIC_COOKIE or msg_type != consts.MSG_TYPE_OFFER:
+                    # Unpack the offer to see if it's legit
+                    unpacked_offer = struct.unpack(consts.OFFER_PACKET_FMT, raw_udp_data)
+                    cookie_val = unpacked_offer[0]
+                    msg_type_val = unpacked_offer[1]
+                    server_tcp_port = unpacked_offer[2]
+                    server_name_bytes = unpacked_offer[3]
+
+                    if cookie_val != consts.MAGIC_COOKIE or msg_type_val != consts.MSG_TYPE_OFFER:
                         continue
                     
-                    self.server_ip = addr[0]
-                    self.server_port = server_port
-                    server_name = server_name_bytes.decode('utf-8').strip('\x00')
+                    self.target_server_ip = sender_address_tuple[0]
+                    self.target_server_port = server_tcp_port
+                    decoded_server_name = server_name_bytes.decode('utf-8').strip('\x00')
                     
-                    print(f"Received offer from {self.server_ip} ({server_name}), attempting to connect...")
+                    print(f"Received offer from {self.target_server_ip} ({decoded_server_name}), attempting to connect...")
                     break
                 except Exception:
                     continue
             
-            self.udp_socket.close()
-            self.connect_and_play()
+            # Close UDP since we found our match
+            self.udp_listening_socket.close()
+            
+            # Move on to the TCP part
+            self.establish_tcp_connection_and_start_session()
 
-    def get_rounds_input(self):
-        """Asks the user for the number of rounds."""
+    def prompt_user_for_identification(self):
+        """Simple input for the name suffix."""
+        id_suffix = input("Enter player number (e.g. 1, 2): ")
+        self.full_player_display_name = f"{self.base_team_name_string} {id_suffix}"
+        print(f"Playing as: {self.full_player_display_name}")
+
+    def prompt_user_for_desired_rounds(self):
+        """Ensures we get a valid integer for rounds."""
         while True:
-            user_input = input("How many rounds do you want to play? ")
-            if user_input.isdigit() and int(user_input) > 0:
-                self.requested_rounds = int(user_input)
+            user_input_str = input("How many rounds do you want to play? ")
+            if user_input_str.isdigit() and int(user_input_str) > 0:
+                self.number_of_rounds_requested = int(user_input_str)
                 break
             print("Invalid input, please enter a number > 0.")
 
-    def connect_and_play(self):
+    def establish_tcp_connection_and_start_session(self):
         try:
-            self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            # Timeout set to 10 minutes for gameplay
-            self.tcp_socket.settimeout(600) 
-            self.tcp_socket.connect((self.server_ip, self.server_port))
+            self.tcp_game_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # 10 minutes timeout to allow human thinking time
+            self.tcp_game_socket.settimeout(600) 
+            self.tcp_game_socket.connect((self.target_server_ip, self.target_server_port))
             
-            # Reset cards for new game
-            self.my_cards = [] 
+            # Wipe the hand clean for a fresh start
+            self.cards_currently_held = [] 
             
-            packet = struct.pack(consts.REQUEST_PACKET_FMT,
-                                 consts.MAGIC_COOKIE,
-                                 consts.MSG_TYPE_REQUEST,
-                                 self.requested_rounds,
-                                 self.player_full_name.encode('utf-8').ljust(32, b'\0'))
-            self.tcp_socket.sendall(packet)
+            # Build the request packet
+            binary_request_packet = struct.pack(
+                consts.REQUEST_PACKET_FMT,
+                consts.MAGIC_COOKIE,
+                consts.MSG_TYPE_REQUEST,
+                self.number_of_rounds_requested,
+                self.full_player_display_name.encode('utf-8').ljust(32, b'\0')
+            )
+            self.tcp_game_socket.sendall(binary_request_packet)
             
-            self.game_loop()
+            self.main_gameplay_execution_loop()
             
         except socket.timeout:
             print("Connection timed out.")
-        except Exception as e:
-            print(f"Error connecting to server: {e}")
+        except Exception as conn_error:
+            print(f"Error connecting to server: {conn_error}")
         finally:
-            if self.tcp_socket:
-                self.tcp_socket.close()
-                self.tcp_socket = None
+            if self.tcp_game_socket:
+                self.tcp_game_socket.close()
+                self.tcp_game_socket = None
 
-    def game_loop(self):
-        wins = 0
-        rounds_played = 0
-        my_turn = True 
+    def main_gameplay_execution_loop(self):
+        total_wins_counter = 0
+        rounds_completed_counter = 0
+        is_it_my_turn = True 
         
-        while rounds_played < self.requested_rounds:
+        # New flag to manage the reveal of the dealer's first card
+        has_dealer_visible_card_been_shown = False
+
+        while rounds_completed_counter < self.number_of_rounds_requested:
             try:
-                data = self.tcp_socket.recv(struct.calcsize(consts.PAYLOAD_SERVER_FMT))
-                if not data: break
+                incoming_payload = self.tcp_game_socket.recv(struct.calcsize(consts.PAYLOAD_SERVER_FMT))
+                if not incoming_payload: 
+                    break
                 
-                cookie, msg_type, result, rank, suit = struct.unpack(consts.PAYLOAD_SERVER_FMT, data)
+                # Unpacking the server's message
+                unpacked_payload = struct.unpack(consts.PAYLOAD_SERVER_FMT, incoming_payload)
+                payload_cookie = unpacked_payload[0]
+                payload_type = unpacked_payload[1]
+                payload_result = unpacked_payload[2]
+                card_rank_val = unpacked_payload[3]
+                card_suit_val = unpacked_payload[4]
                 
-                if cookie != consts.MAGIC_COOKIE or msg_type != consts.MSG_TYPE_PAYLOAD:
+                if payload_cookie != consts.MAGIC_COOKIE or payload_type != consts.MSG_TYPE_PAYLOAD:
                     print("Error: Invalid packet received")
                     break
 
-                if result == consts.RESULT_ROUND_NOT_OVER:
-                    card_str = f"{consts.RANKS[rank]} of {consts.SUITS[suit]}"
+                if payload_result == consts.RESULT_ROUND_NOT_OVER:
+                    formatted_card_string = f"{consts.RANKS[card_rank_val]} of {consts.SUITS[card_suit_val]}"
                     
-                    if my_turn:
-                        print(f"Got card: {card_str}")
-                        self.my_cards.append((rank, suit))
+                    if is_it_my_turn:
+                        # Case 1: Initial deal (first two cards are mine)
+                        if len(self.cards_currently_held) < 2:
+                            print(f"Got card: {formatted_card_string}")
+                            self.cards_currently_held.append((card_rank_val, card_suit_val))
                         
-                        if len(self.my_cards) < 2:
-                            continue
+                        # Case 2: I have 2 cards, so this next one must be the dealer's visible card
+                        elif not has_dealer_visible_card_been_shown:
+                            print(f"Dealer's Face-Up Card: {formatted_card_string}")
+                            has_dealer_visible_card_been_shown = True
+                            
+                            # Only NOW do we ask the user what to do
+                            user_decision = self.get_player_decision_input()
+                            if user_decision == 'stand':
+                                is_it_my_turn = False 
+                                print("Waiting for dealer's move...")
                         
-                        action = self.ask_user_move()
-                        if action == 'stand':
-                            my_turn = False 
-                            print("Waiting for dealer's move...")
-                    else:
-                        print(f"Dealer played: {card_str}")
+                        # Case 3: Normal hit during the game
+                        else:
+                            print(f"Got card: {formatted_card_string}")
+                            self.cards_currently_held.append((card_rank_val, card_suit_val))
+                            
+                            user_decision = self.get_player_decision_input()
+                            if user_decision == 'stand':
+                                is_it_my_turn = False 
+                                print("Waiting for dealer's move...")
 
-                else: # End of round
-                    rounds_played += 1
-                    if result == consts.RESULT_WIN:
+                    else:
+                        # If it's not my turn, the server is sending me dealer's cards
+                        print(f"Dealer played: {formatted_card_string}")
+
+                else: 
+                    # This means the round is over
+                    rounds_completed_counter += 1
+                    
+                    if payload_result == consts.RESULT_WIN:
                         print("### YOU WON! ###")
-                        wins += 1
-                    elif result == consts.RESULT_LOSS:
+                        total_wins_counter += 1
+                    elif payload_result == consts.RESULT_LOSS:
                         print("### YOU LOST... ###")
                     else:
                         print("### IT'S A TIE ###")
                     
                     print("-" * 30)
-                    self.my_cards = [] 
-                    my_turn = True 
+                    # Prepare for next round
+                    self.cards_currently_held = [] 
+                    is_it_my_turn = True 
+                    has_dealer_visible_card_been_shown = False # Reset flag
 
             except socket.timeout:
                 print("Server stopped responding (Timeout).")
                 break
-            except Exception as e:
-                print(f"Game error: {e}")
+            except Exception as game_error:
+                print(f"Game error: {game_error}")
                 break
         
-        print(f"Finished playing {rounds_played} rounds. Win rate: {wins}/{rounds_played}")
+        print(f"Finished playing {rounds_completed_counter} rounds. Win rate: {total_wins_counter}/{rounds_completed_counter}")
         print("Closing connection and looking for a new server...\n")
 
-    def ask_user_move(self):
-        current_val = self.calculate_hand_value(self.my_cards)
-        print(f"Your hand value: {current_val}")
+    def get_player_decision_input(self):
+        """
+        Logic to handle Hit or Stand input, including auto-bust detection.
+        """
+        current_hand_value = self.calculate_current_hand_points(self.cards_currently_held)
+        print(f"Your hand value: {current_hand_value}")
         
-        # --- DOUBLE ACE CHECK (Item 2) ---
-        # If value is > 21 (e.g., 22 from two aces), we return 'bust' immediately.
-        # This prevents the input() prompt from appearing.
-        if current_val > 21:
-            print("Busted! Waiting for server result...")
+        # If we have 22 (double ace) or more, we bust immediately.
+        # FIX: We return 'bust' but removed the "Waiting..." print so it feels instant.
+        if current_hand_value > 21:
             return 'bust'
 
         while True:
-            decision = input("Choose action: (h)it or (s)tand? ").lower()
-            if decision in ['h', 'hit']:
-                self.send_decision("Hittt")
+            raw_input = input("Choose action: (h)it or (s)tand? ").lower()
+            if raw_input in ['h', 'hit']:
+                self.transmit_decision_packet("Hittt")
                 return 'hit'
-            elif decision in ['s', 'stand']:
-                self.send_decision("Stand")
+            elif raw_input in ['s', 'stand']:
+                self.transmit_decision_packet("Stand")
                 return 'stand'
             else:
                 print("Invalid input.")
 
-    def send_decision(self, action_str):
-        packet = struct.pack(consts.PAYLOAD_CLIENT_FMT,
-                             consts.MAGIC_COOKIE,
-                             consts.MSG_TYPE_PAYLOAD,
-                             action_str.encode('utf-8'))
-        self.tcp_socket.sendall(packet)
+    def transmit_decision_packet(self, action_string):
+        binary_decision_packet = struct.pack(
+            consts.PAYLOAD_CLIENT_FMT,
+            consts.MAGIC_COOKIE,
+            consts.MSG_TYPE_PAYLOAD,
+            action_string.encode('utf-8')
+        )
+        self.tcp_game_socket.sendall(binary_decision_packet)
 
-    def calculate_hand_value(self, hand):
-        value = 0
-        for rank, suit in hand:
-            if rank == 1: value += 11 
-            elif rank >= 10: value += 10
-            else: value += rank
-        return value
+    def calculate_current_hand_points(self, hand_list):
+        current_score = 0
+        for r_val, s_val in hand_list:
+            if r_val == 1: 
+                current_score += 11 
+            elif r_val >= 10: 
+                current_score += 10
+            else: 
+                current_score += r_val
+        return current_score
 
 if __name__ == "__main__":
-    client = Client()
-    client.start_client()
+    game_client_instance = Client()
+    game_client_instance.start_client()
