@@ -11,7 +11,7 @@ class Server:
         self.server_ip = self.get_local_ip()
         self.udp_socket = None
         self.tcp_socket = None
-        self.team_name = "BlackjackMasters" 
+        self.team_name = "Festigal Fantasia" 
 
     def get_local_ip(self):
         try:
@@ -39,6 +39,10 @@ class Server:
             try:
                 client_socket, client_address = self.tcp_socket.accept()
                 print(f"New client connected from {client_address}")
+                
+                # Timeout of 10 minutes for gameplay
+                client_socket.settimeout(600)
+                
                 client_thread = threading.Thread(target=self.handle_client, args=(client_socket,))
                 client_thread.start()
             except Exception as e:
@@ -62,10 +66,7 @@ class Server:
                 print(f"Error broadcasting: {e}")
                 time.sleep(1)
 
-    # --- Game Logic Helpers ---
-
     def create_deck(self):
-        """Creates a shuffled deck of 52 cards (Rank 1-13, Suit 0-3)"""
         deck = []
         for suit in range(4):
             for rank in range(1, 14):
@@ -74,26 +75,15 @@ class Server:
         return deck
 
     def calculate_hand_value(self, hand):
-        """Calculates the value of a hand according to Blackjack rules"""
+        """Ace is strictly 11 points."""
         value = 0
-        aces = 0
         for rank, suit in hand:
-            if rank == 1: # Ace
-                aces += 1
-                value += 11
-            elif rank >= 10: # Face cards (10, J, Q, K)
-                value += 10
-            else: # Number cards
-                value += rank
-        
-        # Adjust Aces if bust (change from 11 to 1)
-        while value > 21 and aces > 0:
-            value -= 10
-            aces -= 1
+            if rank == 1: value += 11
+            elif rank >= 10: value += 10
+            else: value += rank
         return value
 
     def send_card(self, client_socket, rank, suit, result_code=consts.RESULT_ROUND_NOT_OVER):
-        """Helper to pack and send a payload message"""
         packet = struct.pack(consts.PAYLOAD_SERVER_FMT,
                              consts.MAGIC_COOKIE,
                              consts.MSG_TYPE_PAYLOAD,
@@ -103,6 +93,8 @@ class Server:
         client_socket.sendall(packet)
 
     def handle_client(self, client_socket):
+        client_name = "Unknown"
+        
         try:
             # 1. Handshake (Receive Request)
             request_size = struct.calcsize(consts.REQUEST_PACKET_FMT)
@@ -110,40 +102,49 @@ class Server:
             if not data or len(data) != request_size: return
 
             cookie, msg_type, num_rounds, team_name_bytes = struct.unpack(consts.REQUEST_PACKET_FMT, data)
-            if cookie != consts.MAGIC_COOKIE or msg_type != consts.MSG_TYPE_REQUEST: return
+            
+            # --- SECURITY CHECK (Item 3) ---
+            # If the first message isn't a REQUEST, disconnect immediately.
+            if cookie != consts.MAGIC_COOKIE or msg_type != consts.MSG_TYPE_REQUEST:
+                print(f"Invalid handshake from client. Closing.")
+                return
 
             client_name = team_name_bytes.decode('utf-8').strip('\x00')
-            print(f"Received request from team: {client_name}, playing {num_rounds} rounds")
+            print(f"[{client_name}] Connected. Playing {num_rounds} rounds.")
 
             # 2. Play Rounds
-            player_wins = 0
-            
             for round_num in range(1, num_rounds + 1):
-                print(f"--- Starting Round {round_num} vs {client_name} ---")
+                print(f"[{client_name}] --- Starting Round {round_num} ---")
                 deck = self.create_deck()
                 player_hand = []
                 dealer_hand = []
 
-                # Initial Deal: 2 cards each
-                # Deal to player (send immediately)
+                # Initial Deal
                 c1 = deck.pop(); player_hand.append(c1); self.send_card(client_socket, *c1)
                 c2 = deck.pop(); player_hand.append(c2); self.send_card(client_socket, *c2)
                 
-                # Deal to dealer (hidden)
                 d1 = deck.pop(); dealer_hand.append(d1)
                 d2 = deck.pop(); dealer_hand.append(d2) 
-                
+
+                print(f"[{client_name}] Dealer Face-Up: {consts.RANKS[d1[0]]} of {consts.SUITS[d1[1]]}")
+
                 # Player Turn
                 player_bust = False
                 while True:
+                    # --- DOUBLE ACE CHECK (Item 2) ---
+                    # This check runs immediately. If Hand > 21 (e.g. 2 Aces = 22), 
+                    # it sets bust=True and breaks immediately, skipping any input waiting.
                     player_val = self.calculate_hand_value(player_hand)
                     if player_val > 21:
                         player_bust = True
-                        break # Bust!
+                        break 
 
-                    # Wait for player decision
-                    # Receive Packet: Cookie(4), Type(1), Decision(5)
-                    data = client_socket.recv(struct.calcsize(consts.PAYLOAD_CLIENT_FMT))
+                    try:
+                        data = client_socket.recv(struct.calcsize(consts.PAYLOAD_CLIENT_FMT))
+                    except socket.timeout:
+                        print(f"[{client_name}] Timed out waiting for action.")
+                        return
+
                     if not data: break
                     
                     _, _, decision_bytes = struct.unpack(consts.PAYLOAD_CLIENT_FMT, data)
@@ -151,52 +152,58 @@ class Server:
 
                     if decision == "Stand":
                         break
-                    elif decision == "Hittt": # Note: "Hittt" per protocol spec
+                    elif decision == "Hittt":
                         new_card = deck.pop()
                         player_hand.append(new_card)
                         self.send_card(client_socket, *new_card)
                     else:
-                        print(f"Unknown decision: {decision}")
                         break
 
                 # Dealer Turn
                 dealer_val = self.calculate_hand_value(dealer_hand)
+                
                 if not player_bust:
-                    # Logic: Hit if < 17
+                    print(f"[{client_name}] Dealer reveals hidden: {consts.RANKS[d2[0]]} of {consts.SUITS[d2[1]]}")
+                    self.send_card(client_socket, *d2)
+                    
+                    d_hand_str = [f"{consts.RANKS[r]} of {consts.SUITS[s]}" for r, s in dealer_hand]
+                    print(f"[{client_name}] Dealer hand: {d_hand_str} (Value: {dealer_val})")
+                    
                     while dealer_val < 17:
                         new_card = deck.pop()
                         dealer_hand.append(new_card)
                         dealer_val = self.calculate_hand_value(dealer_hand)
+                        print(f"[{client_name}] Dealer draws: {consts.RANKS[new_card[0]]} of {consts.SUITS[new_card[1]]}")
+                        self.send_card(client_socket, *new_card)
 
                 # Determine Winner
                 player_val = self.calculate_hand_value(player_hand)
-                result = consts.RESULT_LOSS # Default
+                result = consts.RESULT_LOSS 
                 
                 if player_bust:
                     result = consts.RESULT_LOSS
-                    print(f"Round {round_num}: Player Bust! Dealer Wins.")
+                    print(f"[{client_name}] Round {round_num}: Player Bust! Dealer Wins.")
                 elif dealer_val > 21:
                     result = consts.RESULT_WIN
-                    player_wins += 1
-                    print(f"Round {round_num}: Dealer Bust! Player Wins.")
+                    print(f"[{client_name}] Round {round_num}: Dealer Bust! Player Wins.")
                 elif player_val > dealer_val:
                     result = consts.RESULT_WIN
-                    player_wins += 1
-                    print(f"Round {round_num}: Player > Dealer. Player Wins.")
+                    print(f"[{client_name}] Round {round_num}: Player ({player_val}) > Dealer ({dealer_val}). Player Wins.")
                 elif dealer_val > player_val:
                     result = consts.RESULT_LOSS
-                    print(f"Round {round_num}: Dealer > Player. Dealer Wins.")
+                    print(f"[{client_name}] Round {round_num}: Dealer ({dealer_val}) > Player ({player_val}). Dealer Wins.")
                 else:
                     result = consts.RESULT_TIE
-                    print(f"Round {round_num}: Tie.")
+                    print(f"[{client_name}] Round {round_num}: Tie ({player_val}).")
 
-                # Send Round Result (Using a dummy card 0,0 since round is over)
                 self.send_card(client_socket, 0, 0, result)
 
-            print(f"Finished playing with {client_name}. Closing connection.")
+            print(f"[{client_name}] Finished playing. Closing connection.")
 
+        except socket.timeout:
+            print(f"[{client_name}] Timed out.")
         except Exception as e:
-            print(f"Error handling client: {e}")
+            print(f"[{client_name}] Error handling client: {e}")
         finally:
             client_socket.close()
 
