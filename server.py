@@ -85,11 +85,14 @@ class Server:
         self.udp_broadcast_sender_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp_broadcast_sender_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
+        # Explicitly binding to the WiFi interface to prevent WSL issues
+        self.udp_broadcast_sender_socket.bind((self.local_machine_ip_address, 0))
+
         # Packing the offer message strictly according to protocol
         packed_offer_message = struct.pack(
-            consts.OFFER_PACKET_FMT, 
-            consts.MAGIC_COOKIE, 
-            consts.MSG_TYPE_OFFER, 
+            consts.STRUCT_PACKING_FORMAT_FOR_OFFER, 
+            consts.PROTOCOL_MAGIC_COOKIE_IDENTIFIER, 
+            consts.MESSAGE_TYPE_OFFER_ANNOUNCEMENT, 
             self.tcp_listening_port_number, 
             self.participating_team_name.encode('utf-8').ljust(32, b'\0')
         )
@@ -98,7 +101,7 @@ class Server:
             try:
                 self.udp_broadcast_sender_socket.sendto(
                     packed_offer_message, 
-                    ('<broadcast>', consts.CLIENT_UDP_PORT)
+                    ('<broadcast>', consts.LISTENING_UDP_PORT_FOR_CLIENT_DISCOVERY)
                 )
                 # Sleep for a second to avoid spamming the network too hard
                 time.sleep(1) 
@@ -130,11 +133,11 @@ class Server:
                 accumulated_score += rank_val
         return accumulated_score
 
-    def transmit_game_state_packet(self, target_client_socket, card_rank, card_suit, game_result_code=consts.RESULT_ROUND_NOT_OVER):
+    def transmit_game_state_packet(self, target_client_socket, card_rank, card_suit, game_result_code=consts.GAME_RESULT_INDICATOR_ROUND_STILL_ACTIVE):
         binary_payload_packet = struct.pack(
-            consts.PAYLOAD_SERVER_FMT,
-            consts.MAGIC_COOKIE,
-            consts.MSG_TYPE_PAYLOAD,
+            consts.STRUCT_PACKING_FORMAT_FOR_SERVER_PAYLOAD,
+            consts.PROTOCOL_MAGIC_COOKIE_IDENTIFIER,
+            consts.MESSAGE_TYPE_GAME_PAYLOAD,
             game_result_code,
             card_rank,
             card_suit
@@ -146,21 +149,21 @@ class Server:
         
         try:
             # Step 1: Handle the handshake (Request Packet)
-            expected_packet_size = struct.calcsize(consts.REQUEST_PACKET_FMT)
+            expected_packet_size = struct.calcsize(consts.STRUCT_PACKING_FORMAT_FOR_REQUEST)
             raw_received_bytes = active_client_connection.recv(expected_packet_size)
             
             if not raw_received_bytes or len(raw_received_bytes) != expected_packet_size:
                 return
 
             # Breaking down the unpacked data into variables
-            unpacked_request_data = struct.unpack(consts.REQUEST_PACKET_FMT, raw_received_bytes)
+            unpacked_request_data = struct.unpack(consts.STRUCT_PACKING_FORMAT_FOR_REQUEST, raw_received_bytes)
             received_cookie = unpacked_request_data[0]
             received_msg_type = unpacked_request_data[1]
             requested_rounds_count = unpacked_request_data[2]
             raw_team_name_bytes = unpacked_request_data[3]
             
             # Security check: Kick them out if they didn't send a proper REQUEST msg
-            if received_cookie != consts.MAGIC_COOKIE or received_msg_type != consts.MSG_TYPE_REQUEST:
+            if received_cookie != consts.PROTOCOL_MAGIC_COOKIE_IDENTIFIER or received_msg_type != consts.MESSAGE_TYPE_GAME_REQUEST:
                 print(f"Invalid handshake from client. Closing.")
                 return
 
@@ -190,9 +193,9 @@ class Server:
                 dealer_hidden_card = current_game_deck.pop()
                 cards_held_by_dealer.append(dealer_hidden_card)
 
-                print(f"[{connected_team_name}] Dealer Face-Up: {consts.RANKS[dealer_visible_card[0]]} of {consts.SUITS[dealer_visible_card[1]]}")
+                print(f"[{connected_team_name}] Dealer Face-Up: {consts.CARD_RANKS_MAPPING_DICTIONARY[dealer_visible_card[0]]} of {consts.CARD_SUITS_MAPPING_DICTIONARY[dealer_visible_card[1]]}")
                 
-                # --- FIX: Send the dealer's visible card to the client immediately ---
+                # Send the dealer's visible card to the client immediately
                 self.transmit_game_state_packet(active_client_connection, *dealer_visible_card)
 
                 # Player's Turn Loop
@@ -205,7 +208,7 @@ class Server:
                         break 
 
                     try:
-                        raw_action_data = active_client_connection.recv(struct.calcsize(consts.PAYLOAD_CLIENT_FMT))
+                        raw_action_data = active_client_connection.recv(struct.calcsize(consts.STRUCT_PACKING_FORMAT_FOR_CLIENT_PAYLOAD))
                     except socket.timeout:
                         print(f"[{connected_team_name}] Timed out waiting for action.")
                         return
@@ -214,7 +217,7 @@ class Server:
                         break
                     
                     # Decoding the player's decision
-                    unpacked_action = struct.unpack(consts.PAYLOAD_CLIENT_FMT, raw_action_data)
+                    unpacked_action = struct.unpack(consts.STRUCT_PACKING_FORMAT_FOR_CLIENT_PAYLOAD, raw_action_data)
                     player_decision_string = unpacked_action[2].decode('utf-8').strip('\x00')
 
                     if player_decision_string == "Stand":
@@ -231,11 +234,11 @@ class Server:
                 
                 if not did_player_bust:
                     # Show the card we were hiding
-                    print(f"[{connected_team_name}] Dealer reveals hidden: {consts.RANKS[dealer_hidden_card[0]]} of {consts.SUITS[dealer_hidden_card[1]]}")
+                    print(f"[{connected_team_name}] Dealer reveals hidden: {consts.CARD_RANKS_MAPPING_DICTIONARY[dealer_hidden_card[0]]} of {consts.CARD_SUITS_MAPPING_DICTIONARY[dealer_hidden_card[1]]}")
                     self.transmit_game_state_packet(active_client_connection, *dealer_hidden_card)
                     
                     # Just for logging purposes
-                    dealer_hand_display = [f"{consts.RANKS[r]} of {consts.SUITS[s]}" for r, s in cards_held_by_dealer]
+                    dealer_hand_display = [f"{consts.CARD_RANKS_MAPPING_DICTIONARY[r]} of {consts.CARD_SUITS_MAPPING_DICTIONARY[s]}" for r, s in cards_held_by_dealer]
                     print(f"[{connected_team_name}] Dealer hand: {dealer_hand_display} (Value: {dealer_total_score})")
                     
                     # Dealer hits until 17
@@ -244,31 +247,31 @@ class Server:
                         cards_held_by_dealer.append(dealer_new_card)
                         dealer_total_score = self.compute_total_hand_points(cards_held_by_dealer)
                         
-                        print(f"[{connected_team_name}] Dealer draws: {consts.RANKS[dealer_new_card[0]]} of {consts.SUITS[dealer_new_card[1]]}")
+                        print(f"[{connected_team_name}] Dealer draws: {consts.CARD_RANKS_MAPPING_DICTIONARY[dealer_new_card[0]]} of {consts.CARD_SUITS_MAPPING_DICTIONARY[dealer_new_card[1]]}")
                         self.transmit_game_state_packet(active_client_connection, *dealer_new_card)
 
                 # Determine Winner Logic
                 final_player_score = self.compute_total_hand_points(cards_held_by_player)
-                final_round_result = consts.RESULT_LOSS 
+                final_round_result = consts.GAME_RESULT_INDICATOR_PLAYER_LOSS 
                 
                 if did_player_bust:
-                    final_round_result = consts.RESULT_LOSS
+                    final_round_result = consts.GAME_RESULT_INDICATOR_PLAYER_LOSS
                     print(f"[{connected_team_name}] Round {current_round_number}: Player Bust! Dealer Wins.")
                 
                 elif dealer_total_score > 21:
-                    final_round_result = consts.RESULT_WIN
+                    final_round_result = consts.GAME_RESULT_INDICATOR_PLAYER_WIN
                     print(f"[{connected_team_name}] Round {current_round_number}: Dealer Bust! Player Wins.")
                 
                 elif final_player_score > dealer_total_score:
-                    final_round_result = consts.RESULT_WIN
+                    final_round_result = consts.GAME_RESULT_INDICATOR_PLAYER_WIN
                     print(f"[{connected_team_name}] Round {current_round_number}: Player ({final_player_score}) > Dealer ({dealer_total_score}). Player Wins.")
                 
                 elif dealer_total_score > final_player_score:
-                    final_round_result = consts.RESULT_LOSS
+                    final_round_result = consts.GAME_RESULT_INDICATOR_PLAYER_LOSS
                     print(f"[{connected_team_name}] Round {current_round_number}: Dealer ({dealer_total_score}) > Player ({final_player_score}). Dealer Wins.")
                 
                 else:
-                    final_round_result = consts.RESULT_TIE
+                    final_round_result = consts.GAME_RESULT_INDICATOR_TIE
                     print(f"[{connected_team_name}] Round {current_round_number}: Tie ({final_player_score}).")
 
                 # Send the final verdict to the client

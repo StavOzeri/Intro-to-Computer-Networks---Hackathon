@@ -36,21 +36,21 @@ class Client:
                 # Fallback for Windows which uses REUSEADDR
                 self.udp_listening_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 
-            self.udp_listening_socket.bind(("", consts.CLIENT_UDP_PORT))
+            self.udp_listening_socket.bind(("", consts.LISTENING_UDP_PORT_FOR_CLIENT_DISCOVERY))
 
             # Infinite loop to catch a valid offer packet
             while True:
-                raw_udp_data, sender_address_tuple = self.udp_listening_socket.recvfrom(consts.BUFFER_SIZE)
+                raw_udp_data, sender_address_tuple = self.udp_listening_socket.recvfrom(consts.NETWORK_BUFFER_SIZE_IN_BYTES)
                 
                 try:
                     # Unpack the offer to see if it's legit
-                    unpacked_offer = struct.unpack(consts.OFFER_PACKET_FMT, raw_udp_data)
+                    unpacked_offer = struct.unpack(consts.STRUCT_PACKING_FORMAT_FOR_OFFER, raw_udp_data)
                     cookie_val = unpacked_offer[0]
                     msg_type_val = unpacked_offer[1]
                     server_tcp_port = unpacked_offer[2]
                     server_name_bytes = unpacked_offer[3]
 
-                    if cookie_val != consts.MAGIC_COOKIE or msg_type_val != consts.MSG_TYPE_OFFER:
+                    if cookie_val != consts.PROTOCOL_MAGIC_COOKIE_IDENTIFIER or msg_type_val != consts.MESSAGE_TYPE_OFFER_ANNOUNCEMENT:
                         continue
                     
                     self.target_server_ip = sender_address_tuple[0]
@@ -95,9 +95,9 @@ class Client:
             
             # Build the request packet
             binary_request_packet = struct.pack(
-                consts.REQUEST_PACKET_FMT,
-                consts.MAGIC_COOKIE,
-                consts.MSG_TYPE_REQUEST,
+                consts.STRUCT_PACKING_FORMAT_FOR_REQUEST,
+                consts.PROTOCOL_MAGIC_COOKIE_IDENTIFIER,
+                consts.MESSAGE_TYPE_GAME_REQUEST,
                 self.number_of_rounds_requested,
                 self.full_player_display_name.encode('utf-8').ljust(32, b'\0')
             )
@@ -124,24 +124,24 @@ class Client:
 
         while rounds_completed_counter < self.number_of_rounds_requested:
             try:
-                incoming_payload = self.tcp_game_socket.recv(struct.calcsize(consts.PAYLOAD_SERVER_FMT))
+                incoming_payload = self.tcp_game_socket.recv(struct.calcsize(consts.STRUCT_PACKING_FORMAT_FOR_SERVER_PAYLOAD))
                 if not incoming_payload: 
                     break
                 
                 # Unpacking the server's message
-                unpacked_payload = struct.unpack(consts.PAYLOAD_SERVER_FMT, incoming_payload)
+                unpacked_payload = struct.unpack(consts.STRUCT_PACKING_FORMAT_FOR_SERVER_PAYLOAD, incoming_payload)
                 payload_cookie = unpacked_payload[0]
                 payload_type = unpacked_payload[1]
                 payload_result = unpacked_payload[2]
                 card_rank_val = unpacked_payload[3]
                 card_suit_val = unpacked_payload[4]
                 
-                if payload_cookie != consts.MAGIC_COOKIE or payload_type != consts.MSG_TYPE_PAYLOAD:
+                if payload_cookie != consts.PROTOCOL_MAGIC_COOKIE_IDENTIFIER or payload_type != consts.MESSAGE_TYPE_GAME_PAYLOAD:
                     print("Error: Invalid packet received")
                     break
 
-                if payload_result == consts.RESULT_ROUND_NOT_OVER:
-                    formatted_card_string = f"{consts.RANKS[card_rank_val]} of {consts.SUITS[card_suit_val]}"
+                if payload_result == consts.GAME_RESULT_INDICATOR_ROUND_STILL_ACTIVE:
+                    formatted_card_string = f"{consts.CARD_RANKS_MAPPING_DICTIONARY[card_rank_val]} of {consts.CARD_SUITS_MAPPING_DICTIONARY[card_suit_val]}"
                     
                     if is_it_my_turn:
                         # Case 1: Initial deal (first two cards are mine)
@@ -178,10 +178,10 @@ class Client:
                     # This means the round is over
                     rounds_completed_counter += 1
                     
-                    if payload_result == consts.RESULT_WIN:
+                    if payload_result == consts.GAME_RESULT_INDICATOR_PLAYER_WIN:
                         print("### YOU WON! ###")
                         total_wins_counter += 1
-                    elif payload_result == consts.RESULT_LOSS:
+                    elif payload_result == consts.GAME_RESULT_INDICATOR_PLAYER_LOSS:
                         print("### YOU LOST... ###")
                     else:
                         print("### IT'S A TIE ###")
@@ -210,7 +210,6 @@ class Client:
         print(f"Your hand value: {current_hand_value}")
         
         # If we have 22 (double ace) or more, we bust immediately.
-        # FIX: We return 'bust' but removed the "Waiting..." print so it feels instant.
         if current_hand_value > 21:
             return 'bust'
 
@@ -227,9 +226,9 @@ class Client:
 
     def transmit_decision_packet(self, action_string):
         binary_decision_packet = struct.pack(
-            consts.PAYLOAD_CLIENT_FMT,
-            consts.MAGIC_COOKIE,
-            consts.MSG_TYPE_PAYLOAD,
+            consts.STRUCT_PACKING_FORMAT_FOR_CLIENT_PAYLOAD,
+            consts.PROTOCOL_MAGIC_COOKIE_IDENTIFIER,
+            consts.MESSAGE_TYPE_GAME_PAYLOAD,
             action_string.encode('utf-8')
         )
         self.tcp_game_socket.sendall(binary_decision_packet)
