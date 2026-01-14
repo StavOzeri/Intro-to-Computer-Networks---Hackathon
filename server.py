@@ -64,7 +64,7 @@ class Server:
                 incoming_client_socket, incoming_client_address = self.tcp_connection_listener_socket.accept()
                 print(f"New client connected from {incoming_client_address}")
                 
-                # Setting a generous timeout (10 mins) because humans play slowly
+                # Setting a generous timeout (10 mins)
                 incoming_client_socket.settimeout(600)
                 
                 # Handling each player in their own thread so we can multitask
